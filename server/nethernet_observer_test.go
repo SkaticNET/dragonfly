@@ -67,6 +67,23 @@ func TestNetherNetListenConfigPassesAllObserverCallbacks(t *testing.T) {
 	}
 }
 
+func TestNetherNetRawPacketObserverPreservesPreviousCallback(t *testing.T) {
+	var calls []string
+	conf := Config{NetherNetObservers: NetherNetObservers{ObserveRawPacket: func(minecraft.PacketObservation) {
+		calls = append(calls, "raw")
+	}}}
+	cfg := minecraft.ListenConfig{}
+	cfg.PacketObserver = func(minecraft.PacketObservation) { calls = append(calls, "previous") }
+	cfg = observeNetherNetRawPackets(cfg, conf.NetherNetObservers.ObserveRawPacket)
+	if cfg.PacketObserver == nil {
+		t.Fatal("raw packet observer not installed")
+	}
+	cfg.PacketObserver(minecraft.PacketObservation{})
+	if len(calls) != 2 || calls[0] != "previous" || calls[1] != "raw" {
+		t.Fatalf("raw packet callbacks = %v", calls)
+	}
+}
+
 func TestNetherNetListenConfigInstallsTerminalCleanupForConnectionObservers(t *testing.T) {
 	contextObserver := func(context.Context, NetherNetConnectionID) (context.Context, context.CancelFunc) {
 		return context.Background(), func() {}

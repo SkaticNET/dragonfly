@@ -273,6 +273,7 @@ type NetherNetSignalingObservation struct {
 // NetherNetObservers contains opt-in callbacks for the built-in NetherNet
 // listener. DataChannelMessage can contain raw login and gameplay bytes;
 // TransportSnapshot can contain SDP, ICE credentials, and peer addresses.
+// ObserveRawPacket can contain decoded packet values and raw packet bytes.
 // Callers must restrict access to these sensitive observations.
 type NetherNetObservers struct {
 	ObserveSignaling            func(NetherNetRequestID, NetherNetSignalingObservation)
@@ -280,6 +281,7 @@ type NetherNetObservers struct {
 	TransportNegotiationContext func(context.Context) (context.Context, context.CancelFunc)
 	ConnContext                 func(context.Context, NetherNetConnectionID) (context.Context, context.CancelFunc)
 	ObservePacket               func(NetherNetPacketObservation)
+	ObserveRawPacket            func(minecraft.PacketObservation)
 	ObserveRemoteDescription    func(NetherNetConnectionID, nethernet.RemoteDescriptionStats)
 	ObserveTransportState       func(NetherNetConnectionID, nethernet.TransportLayer, nethernet.TransportState)
 	ObserveDataChannelOpen      func(NetherNetConnectionID, nethernet.MessageReliability)
@@ -429,6 +431,7 @@ func (nc NetherNetConfig) Listener(conf Config) (Listener, error) {
 	}
 	handler := handlerConfig.New()
 	cfg := observeNetherNetPackets(listenerConfig(conf), handler.NetworkID(), observers.ObservePacket)
+	cfg = observeNetherNetRawPackets(cfg, observers.ObserveRawPacket)
 	l, err := cfg.ListenNetwork(minecraft.NetherNet{
 		Signaling:    handler,
 		ListenConfig: lcfg,
@@ -537,6 +540,9 @@ func mergeNetherNetObservers(primary, fallback NetherNetObservers) NetherNetObse
 	}
 	if primary.ObservePacket == nil {
 		primary.ObservePacket = fallback.ObservePacket
+	}
+	if primary.ObserveRawPacket == nil {
+		primary.ObserveRawPacket = fallback.ObserveRawPacket
 	}
 	if primary.ObserveRemoteDescription == nil {
 		primary.ObserveRemoteDescription = fallback.ObserveRemoteDescription
@@ -662,6 +668,20 @@ func observeNetherNetPackets(cfg minecraft.ListenConfig, localNetworkID string, 
 			event.Direction, event.RemoteID, event.LocalID = NetherNetPacketInbound, NetherNetConnectionIDFromAddr(from), NetherNetConnectionIDFromAddr(to)
 		default:
 			return
+		}
+		observe(event)
+	}
+	return cfg
+}
+
+func observeNetherNetRawPackets(cfg minecraft.ListenConfig, observe func(minecraft.PacketObservation)) minecraft.ListenConfig {
+	if observe == nil {
+		return cfg
+	}
+	previous := cfg.PacketObserver
+	cfg.PacketObserver = func(event minecraft.PacketObservation) {
+		if previous != nil {
+			previous(event)
 		}
 		observe(event)
 	}

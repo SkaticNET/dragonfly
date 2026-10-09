@@ -323,10 +323,12 @@ type NetherNetSignalingWireObservation struct {
 // NetherNetUDPWireObservation contains the payload bytes from one ICE/WebRTC
 // UDP socket read or write, including successful empty datagrams.
 type NetherNetUDPWireObservation struct {
-	Direction  NetherNetPacketDirection
-	LocalAddr  net.Addr
-	RemoteAddr net.Addr
-	Bytes      []byte
+	Direction NetherNetPacketDirection
+	// PossiblyTruncated is true when an inbound read has no spare buffer capacity or the platform reports truncation.
+	PossiblyTruncated bool
+	LocalAddr         net.Addr
+	RemoteAddr        net.Addr
+	Bytes             []byte
 }
 
 // NetherNetPacketObservation relates a decoded packet to the remote client on both directions.

@@ -48,6 +48,38 @@ type emptyErrorWireUDPConn struct{ partialWireUDPConn }
 func (emptyErrorWireUDPConn) Read([]byte) (int, error)  { return 0, io.EOF }
 func (emptyErrorWireUDPConn) Write([]byte) (int, error) { return 0, errWirePartialIO }
 
+type fullBufferWireUDPConn struct{ partialWireUDPConn }
+
+func fillFullWireBuffer(p []byte) int {
+	for i := range p {
+		p[i] = 'x'
+	}
+	return len(p)
+}
+
+func (fullBufferWireUDPConn) Read(p []byte) (int, error) { return fillFullWireBuffer(p), nil }
+func (fullBufferWireUDPConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	return fillFullWireBuffer(p), &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 11}, nil
+}
+func (fullBufferWireUDPConn) ReadFromUDP(p []byte) (int, *net.UDPAddr, error) {
+	return fillFullWireBuffer(p), &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 11}, nil
+}
+func (fullBufferWireUDPConn) ReadMsgUDP(p, _ []byte) (int, int, int, *net.UDPAddr, error) {
+	return fillFullWireBuffer(p), 0, 0, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 11}, nil
+}
+
+type flaggedWireUDPConn struct {
+	fullBufferWireUDPConn
+	n, flags int
+}
+
+func (c flaggedWireUDPConn) ReadMsgUDP(p, _ []byte) (int, int, int, *net.UDPAddr, error) {
+	for i := 0; i < c.n; i++ {
+		p[i] = 'x'
+	}
+	return c.n, 0, c.flags, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 11}, nil
+}
+
 type emptyErrorWirePacketConn struct{ net.PacketConn }
 
 func (emptyErrorWirePacketConn) ReadFrom([]byte) (int, net.Addr, error) { return 0, nil, io.EOF }
@@ -107,6 +139,78 @@ func TestNetherNetUDPWireObserverSkipsEmptyErrors(t *testing.T) {
 	}
 	if events != 0 {
 		t.Fatalf("empty failed UDP operations emitted %d observations", events)
+	}
+}
+
+func TestNetherNetUDPWireObserverMarksFullBufferReadsPossiblyTruncated(t *testing.T) {
+	var events []NetherNetUDPWireObservation
+	observe := func(event NetherNetUDPWireObservation) { events = append(events, event) }
+	conn := observeNetherNetUDPConn(fullBufferWireUDPConn{}, observe)
+	buffer := make([]byte, 4)
+	reads := []struct {
+		name string
+		read func() (int, error)
+	}{
+		{name: "Read", read: func() (int, error) { return conn.Read(buffer) }},
+		{name: "ReadFrom", read: func() (int, error) { n, _, err := conn.ReadFrom(buffer); return n, err }},
+		{name: "ReadFromUDP", read: func() (int, error) { n, _, err := conn.ReadFromUDP(buffer); return n, err }},
+		{name: "ReadMsgUDP", read: func() (int, error) { n, _, _, _, err := conn.ReadMsgUDP(buffer, nil); return n, err }},
+	}
+	for i, test := range reads {
+		n, err := test.read()
+		if n != len(buffer) || err != nil {
+			t.Fatalf("%s returned n=%d err=%v", test.name, n, err)
+		}
+		if event := events[i]; event.Direction != NetherNetPacketInbound || !event.PossiblyTruncated || len(event.Bytes) != len(buffer) {
+			t.Fatalf("%s observer did not mark the full-buffer read as possibly truncated: %+v", test.name, event)
+		}
+	}
+
+	packetEvents := 0
+	packet := netherNetWirePacketConn{PacketConn: fullBufferWireUDPConn{}, observe: func(event NetherNetUDPWireObservation) {
+		packetEvents++
+		if event.Direction != NetherNetPacketInbound || !event.PossiblyTruncated || len(event.Bytes) != len(buffer) {
+			t.Fatalf("PacketConn observer did not mark the full-buffer read as possibly truncated: %+v", event)
+		}
+	}}
+	if n, addr, err := packet.ReadFrom(buffer); n != len(buffer) || addr == nil || err != nil || packetEvents != 1 {
+		t.Fatalf("PacketConn.ReadFrom returned n=%d addr=%v err=%v events=%d", n, addr, err, packetEvents)
+	}
+}
+
+func TestNetherNetUDPWireObserverMarksZeroCapacityReadsPossiblyTruncated(t *testing.T) {
+	var events []NetherNetUDPWireObservation
+	observe := func(event NetherNetUDPWireObservation) { events = append(events, event) }
+	conn := observeNetherNetUDPConn(fullBufferWireUDPConn{}, observe)
+	buffer := []byte{}
+	reads := []struct {
+		name string
+		read func() (int, error)
+	}{
+		{name: "Read", read: func() (int, error) { return conn.Read(buffer) }},
+		{name: "ReadFrom", read: func() (int, error) { n, _, err := conn.ReadFrom(buffer); return n, err }},
+		{name: "ReadFromUDP", read: func() (int, error) { n, _, err := conn.ReadFromUDP(buffer); return n, err }},
+		{name: "ReadMsgUDP", read: func() (int, error) { n, _, _, _, err := conn.ReadMsgUDP(buffer, nil); return n, err }},
+	}
+	for i, test := range reads {
+		n, err := test.read()
+		if n != 0 || err != nil {
+			t.Fatalf("%s returned n=%d err=%v", test.name, n, err)
+		}
+		if event := events[i]; event.Direction != NetherNetPacketInbound || !event.PossiblyTruncated || len(event.Bytes) != 0 {
+			t.Fatalf("%s zero-capacity read was not marked ambiguous: %+v", test.name, event)
+		}
+	}
+
+	packetEvents := 0
+	packet := netherNetWirePacketConn{PacketConn: fullBufferWireUDPConn{}, observe: func(event NetherNetUDPWireObservation) {
+		packetEvents++
+		if event.Direction != NetherNetPacketInbound || !event.PossiblyTruncated || len(event.Bytes) != 0 {
+			t.Fatalf("PacketConn zero-capacity read was not marked ambiguous: %+v", event)
+		}
+	}}
+	if n, addr, err := packet.ReadFrom(buffer); n != 0 || addr == nil || err != nil || packetEvents != 1 {
+		t.Fatalf("PacketConn.ReadFrom returned n=%d addr=%v err=%v events=%d", n, addr, err, packetEvents)
 	}
 }
 
@@ -491,7 +595,7 @@ func TestNetherNetUDPWireObserverCapturesEmptyDatagrams(t *testing.T) {
 	if n, _, err := peer.ReadFrom(make([]byte, 8)); n != 0 || err != nil {
 		t.Fatalf("read empty UDP reply: n=%d err=%v", n, err)
 	}
-	if len(events) != 2 || events[0].Direction != NetherNetPacketInbound || events[1].Direction != NetherNetPacketOutbound || len(events[0].Bytes) != 0 || len(events[1].Bytes) != 0 {
+	if len(events) != 2 || events[0].Direction != NetherNetPacketInbound || events[1].Direction != NetherNetPacketOutbound || events[0].PossiblyTruncated || events[1].PossiblyTruncated || len(events[0].Bytes) != 0 || len(events[1].Bytes) != 0 {
 		t.Fatalf("empty UDP datagram observations = %d, want inbound and outbound empty events", len(events))
 	}
 }
@@ -553,7 +657,7 @@ func TestNetherNetUDPWireObserverTapsUDPConnReadWriteVariants(t *testing.T) {
 		if err != nil || !bytes.Equal(buffer[:n], payload) {
 			t.Fatalf("%s returned n=%d err=%v", test.name, n, err)
 		}
-		if event := events[i]; event.Direction != NetherNetPacketInbound || !bytes.Equal(event.Bytes, payload) {
+		if event := events[i]; event.Direction != NetherNetPacketInbound || event.PossiblyTruncated || !bytes.Equal(event.Bytes, payload) {
 			t.Fatalf("%s observer did not preserve inbound bytes", test.name)
 		}
 	}
@@ -575,7 +679,7 @@ func TestNetherNetUDPWireObserverTapsUDPConnReadWriteVariants(t *testing.T) {
 		if err != nil || !bytes.Equal(buffer[:n], payload) {
 			t.Fatalf("peer read after %s returned n=%d err=%v", test.name, n, err)
 		}
-		if event := events[len(reads)+i]; event.Direction != NetherNetPacketOutbound || !bytes.Equal(event.Bytes, payload) {
+		if event := events[len(reads)+i]; event.Direction != NetherNetPacketOutbound || event.PossiblyTruncated || !bytes.Equal(event.Bytes, payload) {
 			t.Fatalf("%s observer did not preserve outbound bytes", test.name)
 		}
 	}
@@ -596,7 +700,7 @@ func TestNetherNetUDPWireObserverTapsUDPConnReadWriteVariants(t *testing.T) {
 	if err != nil || !bytes.Equal(buffer[:n], connectedIn) {
 		t.Fatalf("connected Read returned n=%d err=%v", n, err)
 	}
-	if event := events[len(events)-1]; event.Direction != NetherNetPacketInbound || !bytes.Equal(event.Bytes, connectedIn) {
+	if event := events[len(events)-1]; event.Direction != NetherNetPacketInbound || event.PossiblyTruncated || !bytes.Equal(event.Bytes, connectedIn) {
 		t.Fatal("connected Read observer did not preserve inbound bytes")
 	}
 	if n, err := connected.Write(connectedOut); err != nil || n != len(connectedOut) {
@@ -606,7 +710,7 @@ func TestNetherNetUDPWireObserverTapsUDPConnReadWriteVariants(t *testing.T) {
 	if err != nil || !bytes.Equal(buffer[:n], connectedOut) {
 		t.Fatal("peer read after connected Write")
 	}
-	if event := events[len(events)-1]; event.Direction != NetherNetPacketOutbound || !bytes.Equal(event.Bytes, connectedOut) {
+	if event := events[len(events)-1]; event.Direction != NetherNetPacketOutbound || event.PossiblyTruncated || !bytes.Equal(event.Bytes, connectedOut) {
 		t.Fatal("connected Write observer did not preserve outbound bytes")
 	}
 	if len(events) != len(reads)+len(writes)+2 {

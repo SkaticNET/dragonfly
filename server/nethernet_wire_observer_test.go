@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -14,6 +15,8 @@ import (
 	"github.com/pion/transport/v5"
 	"github.com/pion/transport/v5/stdnet"
 )
+
+type netherNetWireTestContextKey struct{}
 
 var errWirePartialIO = errors.New("partial wire test I/O")
 
@@ -39,6 +42,16 @@ func (partialWireUDPConn) Read(p []byte) (int, error) {
 	return 2, errWirePartialIO
 }
 func (partialWireUDPConn) Write([]byte) (int, error) { return 3, errWirePartialIO }
+
+type emptyErrorWireUDPConn struct{ partialWireUDPConn }
+
+func (emptyErrorWireUDPConn) Read([]byte) (int, error)  { return 0, io.EOF }
+func (emptyErrorWireUDPConn) Write([]byte) (int, error) { return 0, errWirePartialIO }
+
+type emptyErrorWirePacketConn struct{ net.PacketConn }
+
+func (emptyErrorWirePacketConn) ReadFrom([]byte) (int, net.Addr, error) { return 0, nil, io.EOF }
+func (emptyErrorWirePacketConn) WriteTo([]byte, net.Addr) (int, error)  { return 0, errWirePartialIO }
 
 func TestNetherNetWireObserversCapturePartialIOWithErrors(t *testing.T) {
 	var signaling []NetherNetSignalingWireObservation
@@ -70,6 +83,30 @@ func TestNetherNetWireObserversCapturePartialIOWithErrors(t *testing.T) {
 	}
 	if len(datagrams) != 2 || datagrams[0].Direction != NetherNetPacketInbound || !bytes.Equal(datagrams[0].Bytes, []byte("re")) || datagrams[1].Direction != NetherNetPacketOutbound || !bytes.Equal(datagrams[1].Bytes, []byte("wri")) {
 		t.Fatal("UDP observer missed partial I/O bytes")
+	}
+}
+
+func TestNetherNetUDPWireObserverSkipsEmptyErrors(t *testing.T) {
+	events := 0
+	observe := func(NetherNetUDPWireObservation) { events++ }
+	buffer := make([]byte, 8)
+
+	udp := observeNetherNetUDPConn(emptyErrorWireUDPConn{}, observe)
+	if n, err := udp.Read(buffer); n != 0 || err != io.EOF {
+		t.Fatalf("UDP read returned n=%d err=%v", n, err)
+	}
+	if n, err := udp.Write(nil); n != 0 || err != errWirePartialIO {
+		t.Fatalf("UDP write returned n=%d err=%v", n, err)
+	}
+	packet := netherNetWirePacketConn{PacketConn: emptyErrorWirePacketConn{}, observe: observe}
+	if n, _, err := packet.ReadFrom(buffer); n != 0 || err != io.EOF {
+		t.Fatalf("PacketConn read returned n=%d err=%v", n, err)
+	}
+	if n, err := packet.WriteTo(nil, nil); n != 0 || err != errWirePartialIO {
+		t.Fatalf("PacketConn write returned n=%d err=%v", n, err)
+	}
+	if events != 0 {
+		t.Fatalf("empty failed UDP operations emitted %d observations", events)
 	}
 }
 
@@ -134,6 +171,83 @@ func TestNetherNetSignalingWireObserverCapturesRawChunkedHTTP(t *testing.T) {
 	}
 	if !bytes.HasPrefix(outbound, []byte("HTTP/1.1 204 No Content\r\n")) {
 		t.Fatalf("captured response length = %d, want raw HTTP response bytes", len(outbound))
+	}
+}
+
+func TestNetherNetSignalingObservationCorrelatesWireConnection(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal("listen on loopback")
+	}
+	defer listener.Close()
+
+	wireIDs := make(chan NetherNetConnectionID, 4)
+	signaling := make(chan NetherNetSignalingObservation, 1)
+	contextPreserved := make(chan bool, 1)
+	observers := NetherNetObservers{
+		ObserveSignalingWire: func(event NetherNetSignalingWireObservation) {
+			select {
+			case wireIDs <- event.ConnectionID:
+			default:
+			}
+		},
+		ObserveSignaling: func(_ NetherNetRequestID, event NetherNetSignalingObservation) {
+			signaling <- event
+		},
+	}
+	httpServer := &http.Server{
+		Handler: observeNetherNetSignaling(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			contextPreserved <- r.Context().Value(netherNetWireTestContextKey{}) == "preserved"
+			w.WriteHeader(http.StatusNoContent)
+		}), observers),
+		ConnContext: func(ctx context.Context, _ net.Conn) context.Context {
+			return context.WithValue(ctx, netherNetWireTestContextKey{}, "preserved")
+		},
+	}
+	httpServer.ConnContext = observeNetherNetWireConnContext(httpServer.ConnContext)
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- httpServer.Serve(observeNetherNetSignalingWire(listener, observers.ObserveSignalingWire))
+	}()
+
+	conn, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal("connect to local HTTP listener")
+	}
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal("set client deadline")
+	}
+	request := []byte("GET /v1/join HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	if n, err := conn.Write(request); err != nil || n != len(request) {
+		t.Fatalf("write local request: n=%d err=%v", n, err)
+	}
+	if _, err := io.Copy(io.Discard, conn); err != nil {
+		t.Fatal("read local HTTP response")
+	}
+	_ = conn.Close()
+	if err := httpServer.Close(); err != nil {
+		t.Fatal("close local HTTP server")
+	}
+	if err := <-serveDone; err != http.ErrServerClosed {
+		t.Fatalf("HTTP serve exit = %v", err)
+	}
+
+	if !<-contextPreserved {
+		t.Fatal("HTTPServer.ConnContext result was not preserved")
+	}
+	var wireID NetherNetConnectionID
+	select {
+	case wireID = <-wireIDs:
+	case <-time.After(5 * time.Second):
+		t.Fatal("signaling wire observation was not emitted")
+	}
+	select {
+	case event := <-signaling:
+		if wireID == "" || event.WireConnectionID != wireID {
+			t.Fatal("signaling request did not correlate to its raw TCP connection")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("signaling observation was not emitted")
 	}
 }
 
@@ -335,6 +449,50 @@ func TestNetherNetUDPWireObserverTapsPacketConn(t *testing.T) {
 	}
 	if len(events) != 2 || events[0].Direction != NetherNetPacketInbound || !bytes.Equal(events[0].Bytes, request) || events[1].Direction != NetherNetPacketOutbound || !bytes.Equal(events[1].Bytes, reply) {
 		t.Fatalf("packet observer directions or copied bytes are incorrect: events=%d", len(events))
+	}
+}
+
+func TestNetherNetUDPWireObserverCapturesEmptyDatagrams(t *testing.T) {
+	base, err := stdnet.NewNet()
+	if err != nil {
+		t.Fatal("create Pion stdnet")
+	}
+	var events []NetherNetUDPWireObservation
+	tap := observeNetherNetUDPNet(base, func(event NetherNetUDPWireObservation) {
+		events = append(events, event)
+	})
+	pc, err := tap.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal("listen packet through Pion net")
+	}
+	defer pc.Close()
+	peer, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal("listen UDP peer")
+	}
+	defer peer.Close()
+	if err := pc.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal("set packet deadline")
+	}
+	if err := peer.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal("set peer deadline")
+	}
+
+	if n, err := peer.WriteTo(nil, pc.LocalAddr()); n != 0 || err != nil {
+		t.Fatalf("write empty UDP datagram: n=%d err=%v", n, err)
+	}
+	n, remote, err := pc.ReadFrom(make([]byte, 8))
+	if n != 0 || remote == nil || err != nil {
+		t.Fatalf("net.PacketConn.ReadFrom empty datagram: n=%d remote=%v err=%v", n, remote, err)
+	}
+	if n, err := pc.WriteTo(nil, remote); n != 0 || err != nil {
+		t.Fatalf("write empty UDP reply: n=%d err=%v", n, err)
+	}
+	if n, _, err := peer.ReadFrom(make([]byte, 8)); n != 0 || err != nil {
+		t.Fatalf("read empty UDP reply: n=%d err=%v", n, err)
+	}
+	if len(events) != 2 || events[0].Direction != NetherNetPacketInbound || events[1].Direction != NetherNetPacketOutbound || len(events[0].Bytes) != 0 || len(events[1].Bytes) != 0 {
+		t.Fatalf("empty UDP datagram observations = %d, want inbound and outbound empty events", len(events))
 	}
 }
 

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"net"
 	"sync"
 
@@ -17,6 +18,25 @@ func observeNetherNetSignalingWire(listener net.Listener, observe func(NetherNet
 		return listener
 	}
 	return netherNetWireListener{Listener: listener, observe: observe}
+}
+
+type netherNetWireConnectionIDContextKey struct{}
+
+func observeNetherNetWireConnContext(previous func(context.Context, net.Conn) context.Context) func(context.Context, net.Conn) context.Context {
+	return func(ctx context.Context, conn net.Conn) context.Context {
+		if previous != nil {
+			ctx = previous(ctx, conn)
+		}
+		if wireConn, ok := conn.(*netherNetWireConn); ok {
+			ctx = context.WithValue(ctx, netherNetWireConnectionIDContextKey{}, wireConn.connectionID)
+		}
+		return ctx
+	}
+}
+
+func netherNetWireConnectionIDFromContext(ctx context.Context) NetherNetConnectionID {
+	id, _ := ctx.Value(netherNetWireConnectionIDContextKey{}).(NetherNetConnectionID)
+	return id
 }
 
 func (l netherNetWireListener) Accept() (net.Conn, error) {
@@ -132,7 +152,7 @@ type netherNetWirePacketConn struct {
 
 func (c netherNetWirePacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	n, addr, err := c.PacketConn.ReadFrom(p)
-	if n > 0 {
+	if n > 0 || err == nil {
 		observeNetherNetUDPBytes(c.observe, NetherNetPacketInbound, c.LocalAddr(), addr, p[:n])
 	}
 	return n, addr, err
@@ -140,7 +160,7 @@ func (c netherNetWirePacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 
 func (c netherNetWirePacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	n, err := c.PacketConn.WriteTo(p, addr)
-	if n > 0 {
+	if n > 0 || err == nil {
 		observeNetherNetUDPBytes(c.observe, NetherNetPacketOutbound, c.LocalAddr(), addr, p[:n])
 	}
 	return n, err
@@ -160,7 +180,7 @@ func observeNetherNetUDPConn(conn transport.UDPConn, observe func(NetherNetUDPWi
 
 func (c netherNetWireUDPConn) Read(p []byte) (int, error) {
 	n, err := c.UDPConn.Read(p)
-	if n > 0 {
+	if n > 0 || err == nil {
 		observeNetherNetUDPBytes(c.observe, NetherNetPacketInbound, c.LocalAddr(), c.RemoteAddr(), p[:n])
 	}
 	return n, err
@@ -168,7 +188,7 @@ func (c netherNetWireUDPConn) Read(p []byte) (int, error) {
 
 func (c netherNetWireUDPConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	n, addr, err := c.UDPConn.ReadFrom(p)
-	if n > 0 {
+	if n > 0 || err == nil {
 		observeNetherNetUDPBytes(c.observe, NetherNetPacketInbound, c.LocalAddr(), addr, p[:n])
 	}
 	return n, addr, err
@@ -176,7 +196,7 @@ func (c netherNetWireUDPConn) ReadFrom(p []byte) (int, net.Addr, error) {
 
 func (c netherNetWireUDPConn) ReadFromUDP(p []byte) (int, *net.UDPAddr, error) {
 	n, addr, err := c.UDPConn.ReadFromUDP(p)
-	if n > 0 {
+	if n > 0 || err == nil {
 		observeNetherNetUDPBytes(c.observe, NetherNetPacketInbound, c.LocalAddr(), addr, p[:n])
 	}
 	return n, addr, err
@@ -184,7 +204,7 @@ func (c netherNetWireUDPConn) ReadFromUDP(p []byte) (int, *net.UDPAddr, error) {
 
 func (c netherNetWireUDPConn) ReadMsgUDP(p, oob []byte) (int, int, int, *net.UDPAddr, error) {
 	n, oobn, flags, addr, err := c.UDPConn.ReadMsgUDP(p, oob)
-	if n > 0 {
+	if n > 0 || err == nil {
 		observeNetherNetUDPBytes(c.observe, NetherNetPacketInbound, c.LocalAddr(), addr, p[:n])
 	}
 	return n, oobn, flags, addr, err
@@ -192,7 +212,7 @@ func (c netherNetWireUDPConn) ReadMsgUDP(p, oob []byte) (int, int, int, *net.UDP
 
 func (c netherNetWireUDPConn) Write(p []byte) (int, error) {
 	n, err := c.UDPConn.Write(p)
-	if n > 0 {
+	if n > 0 || err == nil {
 		observeNetherNetUDPBytes(c.observe, NetherNetPacketOutbound, c.LocalAddr(), c.RemoteAddr(), p[:n])
 	}
 	return n, err
@@ -200,7 +220,7 @@ func (c netherNetWireUDPConn) Write(p []byte) (int, error) {
 
 func (c netherNetWireUDPConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	n, err := c.UDPConn.WriteTo(p, addr)
-	if n > 0 {
+	if n > 0 || err == nil {
 		observeNetherNetUDPBytes(c.observe, NetherNetPacketOutbound, c.LocalAddr(), addr, p[:n])
 	}
 	return n, err
@@ -208,7 +228,7 @@ func (c netherNetWireUDPConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 
 func (c netherNetWireUDPConn) WriteToUDP(p []byte, addr *net.UDPAddr) (int, error) {
 	n, err := c.UDPConn.WriteToUDP(p, addr)
-	if n > 0 {
+	if n > 0 || err == nil {
 		observeNetherNetUDPBytes(c.observe, NetherNetPacketOutbound, c.LocalAddr(), addr, p[:n])
 	}
 	return n, err
@@ -216,7 +236,7 @@ func (c netherNetWireUDPConn) WriteToUDP(p []byte, addr *net.UDPAddr) (int, erro
 
 func (c netherNetWireUDPConn) WriteMsgUDP(p, oob []byte, addr *net.UDPAddr) (int, int, error) {
 	n, oobn, err := c.UDPConn.WriteMsgUDP(p, oob, addr)
-	if n > 0 {
+	if n > 0 || err == nil {
 		remote := net.Addr(addr)
 		if addr == nil {
 			remote = c.RemoteAddr()
@@ -227,7 +247,7 @@ func (c netherNetWireUDPConn) WriteMsgUDP(p, oob []byte, addr *net.UDPAddr) (int
 }
 
 func observeNetherNetUDPBytes(observe func(NetherNetUDPWireObservation), direction NetherNetPacketDirection, local, remote net.Addr, payload []byte) {
-	if observe == nil || len(payload) == 0 {
+	if observe == nil {
 		return
 	}
 	event := NetherNetUDPWireObservation{

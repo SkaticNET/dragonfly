@@ -261,15 +261,17 @@ const (
 	NetherNetRouteOther     NetherNetSignalingRoute = "other"
 )
 
-// NetherNetSignalingObservation contains reduced HTTP metadata only. It never
-// includes request paths, addresses, headers, bodies or signaling payloads.
+// NetherNetSignalingObservation contains reduced HTTP metadata and an opaque
+// signaling wire connection ID. It never includes paths, addresses, headers,
+// bodies or signaling payloads.
 type NetherNetSignalingObservation struct {
-	Route          NetherNetSignalingRoute
-	Method         string
-	StatusCode     int
-	RequestLength  int64
-	ResponseLength int
-	Duration       time.Duration
+	WireConnectionID NetherNetConnectionID
+	Route            NetherNetSignalingRoute
+	Method           string
+	StatusCode       int
+	RequestLength    int64
+	ResponseLength   int
+	Duration         time.Duration
 }
 
 // NetherNetObservers contains opt-in callbacks for the built-in NetherNet
@@ -318,8 +320,8 @@ type NetherNetSignalingWireObservation struct {
 	Bytes        []byte
 }
 
-// NetherNetUDPWireObservation contains the n > 0 payload bytes from one
-// ICE/WebRTC UDP socket read or write.
+// NetherNetUDPWireObservation contains the payload bytes from one ICE/WebRTC
+// UDP socket read or write, including successful empty datagrams.
 type NetherNetUDPWireObservation struct {
 	Direction  NetherNetPacketDirection
 	LocalAddr  net.Addr
@@ -485,6 +487,9 @@ func (nc NetherNetConfig) Listener(conf Config) (Listener, error) {
 
 	var signalingHandler http.Handler = observeNetherNetSignaling(handler, observers)
 	httpServer.Handler = logHTTPRequests(httpLog, signalingHandler)
+	if observers.ObserveSignalingWire != nil {
+		httpServer.ConnContext = observeNetherNetWireConnContext(httpServer.ConnContext)
+	}
 	serving = true
 	go func() {
 		err := httpServer.Serve(observeNetherNetSignalingWire(tcp, observers.ObserveSignalingWire))
@@ -779,7 +784,7 @@ func observeNetherNetSignaling(next http.Handler, observers NetherNetObservers) 
 			route = NetherNetRouteJoinOffer
 		}
 		if observers.ObserveSignaling != nil {
-			observers.ObserveSignaling(requestID, NetherNetSignalingObservation{Route: route, Method: method, StatusCode: status, RequestLength: r.ContentLength, ResponseLength: counted.bytes, Duration: time.Since(started)})
+			observers.ObserveSignaling(requestID, NetherNetSignalingObservation{WireConnectionID: netherNetWireConnectionIDFromContext(r.Context()), Route: route, Method: method, StatusCode: status, RequestLength: r.ContentLength, ResponseLength: counted.bytes, Duration: time.Since(started)})
 		}
 	})
 }

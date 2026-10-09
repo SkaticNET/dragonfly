@@ -238,11 +238,15 @@ func NetherNetConnectionIDFromAddr(addr net.Addr) NetherNetConnectionID {
 	if !ok || nnAddr == nil {
 		return ""
 	}
+	return netherNetConnectionID(nnAddr.NetworkID, nnAddr.ConnectionID)
+}
+
+func netherNetConnectionID(networkID string, id uint64) NetherNetConnectionID {
 	var hash maphash.Hash
 	hash.SetSeed(netherNetConnectionIDSeed)
-	_, _ = hash.WriteString(nnAddr.NetworkID)
+	_, _ = hash.WriteString(networkID)
 	var connectionID [8]byte
-	binary.BigEndian.PutUint64(connectionID[:], nnAddr.ConnectionID)
+	binary.BigEndian.PutUint64(connectionID[:], id)
 	_, _ = hash.Write(connectionID[:])
 	return NetherNetConnectionID(strconv.FormatUint(hash.Sum64(), 16))
 }
@@ -266,18 +270,39 @@ type NetherNetSignalingObservation struct {
 	Duration       time.Duration
 }
 
-// NetherNetObservers contains reduced callbacks for the built-in NetherNet
-// listener. No callback receives a connection, HTTP handler, address, or payload.
+// NetherNetObservers contains opt-in callbacks for the built-in NetherNet
+// listener. DataChannelMessage can contain raw login and gameplay bytes;
+// TransportSnapshot can contain SDP, ICE credentials, and peer addresses.
+// Callers must restrict access to these sensitive observations.
 type NetherNetObservers struct {
 	ObserveSignaling            func(NetherNetRequestID, NetherNetSignalingObservation)
 	SignalingNegotiationContext func(context.Context, NetherNetRequestID) (context.Context, context.CancelFunc)
 	TransportNegotiationContext func(context.Context) (context.Context, context.CancelFunc)
 	ConnContext                 func(context.Context, NetherNetConnectionID) (context.Context, context.CancelFunc)
-	ObservePacket               func(NetherNetConnectionID, NetherNetConnectionID, uint32, int)
+	ObservePacket               func(NetherNetPacketObservation)
 	ObserveRemoteDescription    func(NetherNetConnectionID, nethernet.RemoteDescriptionStats)
 	ObserveTransportState       func(NetherNetConnectionID, nethernet.TransportLayer, nethernet.TransportState)
 	ObserveDataChannelOpen      func(NetherNetConnectionID, nethernet.MessageReliability)
+	ObserveDataChannelMessage   func(NetherNetConnectionID, nethernet.DataChannelMessageObservation)
+	ObserveTransportSnapshot    func(NetherNetConnectionID, nethernet.TransportSnapshotObservation)
+	ObserveConnectionState      func(NetherNetConnectionID, nethernet.ConnectionStateObservation)
 	ObserveCorrelationDrop      func(NetherNetConnectionID)
+}
+
+type NetherNetPacketDirection string
+
+const (
+	NetherNetPacketInbound  NetherNetPacketDirection = "inbound"
+	NetherNetPacketOutbound NetherNetPacketDirection = "outbound"
+)
+
+// NetherNetPacketObservation relates a decoded packet to the remote client on both directions.
+type NetherNetPacketObservation struct {
+	RemoteID  NetherNetConnectionID
+	LocalID   NetherNetConnectionID
+	Direction NetherNetPacketDirection
+	PacketID  uint32
+	Length    int
 }
 
 // parsePortRange parses "port" or "min-max" as a PortRange. An empty string
@@ -403,7 +428,7 @@ func (nc NetherNetConfig) Listener(conf Config) (Listener, error) {
 		}
 	}
 	handler := handlerConfig.New()
-	cfg := observeNetherNetPackets(listenerConfig(conf), observers.ObservePacket)
+	cfg := observeNetherNetPackets(listenerConfig(conf), handler.NetworkID(), observers.ObservePacket)
 	l, err := cfg.ListenNetwork(minecraft.NetherNet{
 		Signaling:    handler,
 		ListenConfig: lcfg,
@@ -473,6 +498,27 @@ func netherNetListenConfig(nc NetherNetConfig, conf Config, log *slog.Logger, ap
 			}
 		}
 	}
+	if observers.ObserveDataChannelMessage != nil {
+		cfg.ObserveDataChannelMessage = func(event nethernet.DataChannelMessageObservation) {
+			observers.ObserveDataChannelMessage(netherNetConnectionID(event.NetworkID, event.ConnectionID), event)
+		}
+	}
+	if observers.ObserveTransportSnapshot != nil {
+		cfg.ObserveTransportSnapshot = func(event nethernet.TransportSnapshotObservation) {
+			observers.ObserveTransportSnapshot(netherNetConnectionID(event.NetworkID, event.ConnectionID), event)
+		}
+	}
+	if observers.ObserveConnectionState != nil || observers.ConnContext != nil || observers.ObserveRemoteDescription != nil || observers.ObserveTransportState != nil || observers.ObserveDataChannelOpen != nil {
+		cfg.ObserveConnectionState = func(event nethernet.ConnectionStateObservation) {
+			id := netherNetConnectionID(event.NetworkID, event.ConnectionID)
+			if event.State == nethernet.ConnectionStateClosed {
+				ids.deleteID(id)
+			}
+			if observers.ObserveConnectionState != nil {
+				observers.ObserveConnectionState(id, event)
+			}
+		}
+	}
 	return cfg
 }
 
@@ -500,6 +546,15 @@ func mergeNetherNetObservers(primary, fallback NetherNetObservers) NetherNetObse
 	}
 	if primary.ObserveDataChannelOpen == nil {
 		primary.ObserveDataChannelOpen = fallback.ObserveDataChannelOpen
+	}
+	if primary.ObserveDataChannelMessage == nil {
+		primary.ObserveDataChannelMessage = fallback.ObserveDataChannelMessage
+	}
+	if primary.ObserveTransportSnapshot == nil {
+		primary.ObserveTransportSnapshot = fallback.ObserveTransportSnapshot
+	}
+	if primary.ObserveConnectionState == nil {
+		primary.ObserveConnectionState = fallback.ObserveConnectionState
 	}
 	if primary.ObserveCorrelationDrop == nil {
 		primary.ObserveCorrelationDrop = fallback.ObserveCorrelationDrop
@@ -572,7 +627,20 @@ func (ids *netherNetObserverIDs) delete(conn *nethernet.Conn) {
 	ids.mu.Unlock()
 }
 
-func observeNetherNetPackets(cfg minecraft.ListenConfig, observe func(NetherNetConnectionID, NetherNetConnectionID, uint32, int)) minecraft.ListenConfig {
+func (ids *netherNetObserverIDs) deleteID(id NetherNetConnectionID) {
+	if ids == nil || id == "" {
+		return
+	}
+	ids.mu.Lock()
+	for conn, entry := range ids.entries {
+		if entry.id == id {
+			delete(ids.entries, conn)
+		}
+	}
+	ids.mu.Unlock()
+}
+
+func observeNetherNetPackets(cfg minecraft.ListenConfig, localNetworkID string, observe func(NetherNetPacketObservation)) minecraft.ListenConfig {
 	if observe == nil {
 		return cfg
 	}
@@ -581,7 +649,21 @@ func observeNetherNetPackets(cfg minecraft.ListenConfig, observe func(NetherNetC
 		if previous != nil {
 			previous(header, payload, source, destination)
 		}
-		observe(NetherNetConnectionIDFromAddr(source), NetherNetConnectionIDFromAddr(destination), header.PacketID, len(payload))
+		from, fromOK := source.(*nethernet.Addr)
+		to, toOK := destination.(*nethernet.Addr)
+		if !fromOK || !toOK || from == nil || to == nil {
+			return
+		}
+		event := NetherNetPacketObservation{PacketID: header.PacketID, Length: len(payload)}
+		switch {
+		case from.NetworkID == localNetworkID && to.NetworkID != localNetworkID:
+			event.Direction, event.RemoteID, event.LocalID = NetherNetPacketOutbound, NetherNetConnectionIDFromAddr(to), NetherNetConnectionIDFromAddr(from)
+		case to.NetworkID == localNetworkID && from.NetworkID != localNetworkID:
+			event.Direction, event.RemoteID, event.LocalID = NetherNetPacketInbound, NetherNetConnectionIDFromAddr(from), NetherNetConnectionIDFromAddr(to)
+		default:
+			return
+		}
+		observe(event)
 	}
 	return cfg
 }

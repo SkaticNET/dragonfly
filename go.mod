@@ -56,4 +56,8 @@ require (
 	gopkg.in/yaml.v2 v2.3.0 // indirect
 )
 
-replace github.com/df-mc/go-nethernet => github.com/SkaticNET/go-nethernet v1.0.25-0.20261008113227-5c66df18359d
+replace github.com/df-mc/go-nethernet => github.com/SkaticNET/go-nethernet v1.0.25-0.20261009113933-5c66b8107275
+
+replace github.com/sandertv/gophertunnel => github.com/SkaticNET/gophertunnel v1.62.1-0.20261009113647-1d9fb799eac7
+
+replace github.com/sandertv/go-raknet => github.com/SkaticNET/go-raknet v1.15.2-0.20261009112046-184026fdb6e6

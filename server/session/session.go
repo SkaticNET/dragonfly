@@ -35,6 +35,7 @@ import (
 type Session struct {
 	conf           Config
 	once, connOnce sync.Once
+	packetOrdinal  atomic.Uint64
 
 	ent      *world.EntityHandle
 	conn     Conn
@@ -158,6 +159,9 @@ var errSelfRuntimeID = errors.New("invalid entity runtime ID: runtime ID for sel
 
 type Config struct {
 	Log *slog.Logger
+	// ObservePacket is called after each inbound packet is dispatched, with only
+	// its connection, wire ordinal, ID, type, and bounded outcome status.
+	ObservePacket func(Conn, PacketOutcome)
 
 	MaxChunkRadius int
 
@@ -171,6 +175,25 @@ type Config struct {
 	HandleStop func(*world.Tx, Controllable)
 	// BlockRegistry overrides the registry used for network serialization. If nil, world.DefaultBlockRegistry is used.
 	BlockRegistry world.BlockRegistry
+}
+
+// PacketStatus is the reduced outcome of dispatching an inbound packet.
+type PacketStatus string
+
+const (
+	PacketHandled      PacketStatus = "handled"
+	PacketUnhandled    PacketStatus = "unhandled"
+	PacketUnknown      PacketStatus = "unknown"
+	PacketHandlerError PacketStatus = "handler_error"
+)
+
+// PacketOutcome contains metadata safe for bounded packet-dispatch observation.
+type PacketOutcome struct {
+	Ordinal  uint64
+	SubIndex uint32
+	ID       uint32
+	Type     string
+	Status   PacketStatus
 }
 
 func (conf Config) New(conn Conn) *Session {
@@ -562,19 +585,48 @@ func (s *Session) ChunkRadius() int32 {
 // handlePacket handles an incoming packet, processing it accordingly. If the packet had invalid data or was
 // otherwise not valid in its context, an error is returned.
 func (s *Session) handlePacket(pk packet.Packet, tx *world.Tx, c Controllable) (err error) {
+	ordinal, subIndex := s.nextPacketOrdinal()
+	observe := func(status PacketStatus) {
+		if s.conf.ObservePacket != nil {
+			s.conf.ObservePacket(s.conn, PacketOutcome{Ordinal: ordinal, SubIndex: subIndex, ID: pk.ID(), Type: fmt.Sprintf("%T", pk), Status: status})
+		}
+	}
 	handler, ok := s.handlers[pk.ID()]
 	if !ok {
-		s.conf.Log.Debug("unhandled packet", "packet", fmt.Sprintf("%T", pk), "data", fmt.Sprintf("%+v", pk)[1:])
+		s.conf.Log.Debug("unhandled packet", "packet", fmt.Sprintf("%T", pk), "id", pk.ID())
+		observe(PacketUnknown)
 		return nil
 	}
 	if handler == nil {
 		// A nil handler means it was explicitly unhandled.
+		observe(PacketUnhandled)
 		return nil
 	}
 	if err := handler.Handle(pk, s, tx, c); err != nil {
+		observe(PacketHandlerError)
 		return fmt.Errorf("%T: %w", pk, err)
 	}
+	observe(PacketHandled)
 	return nil
+}
+
+func (s *Session) nextPacketOrdinal() (uint64, uint32) {
+	if source, ok := s.conn.(interface {
+		LastPacketMetadata() minecraft.PacketMetadata
+	}); ok {
+		metadata := source.LastPacketMetadata()
+		if metadata.Direction == minecraft.PacketDirectionInbound && metadata.Ordinal != 0 {
+			return metadata.Ordinal, metadata.SubIndex
+		}
+	}
+	if source, ok := s.conn.(interface {
+		LastPacketOrdinal() (uint64, uint32, bool)
+	}); ok {
+		if ordinal, subIndex, valid := source.LastPacketOrdinal(); valid && ordinal != 0 {
+			return ordinal, subIndex
+		}
+	}
+	return s.packetOrdinal.Add(1), 0
 }
 
 // registerHandlers registers all packet handlers found in the packetHandler package.

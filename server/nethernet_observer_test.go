@@ -89,25 +89,38 @@ func TestNetherNetListenConfigInstallsTerminalCleanupForConnectionObservers(t *t
 }
 
 func TestNetherNetPacketObserverReceivesReducedMetadata(t *testing.T) {
-	var gotSource, gotDestination NetherNetConnectionID
-	var gotPacketID uint32
-	var gotLength int
+	var got []NetherNetPacketObservation
 	called := 0
-	cfg := observeNetherNetPackets(minecraft.ListenConfig{PacketFunc: func(packet.Header, []byte, net.Addr, net.Addr) { called++ }}, func(source, destination NetherNetConnectionID, packetID uint32, length int) {
-		gotSource, gotDestination, gotPacketID, gotLength = source, destination, packetID, length
+	local := &nethernet.Addr{NetworkID: "private-local", ConnectionID: 43, SelectedCandidate: &webrtc.ICECandidate{Address: "192.0.2.11", Port: 45322}}
+	remote := &nethernet.Addr{NetworkID: "private-remote", ConnectionID: 42, SelectedCandidate: &webrtc.ICECandidate{Address: "192.0.2.10", Port: 45321}}
+	cfg := observeNetherNetPackets(minecraft.ListenConfig{PacketFunc: func(packet.Header, []byte, net.Addr, net.Addr) { called++ }}, "private-local", func(event NetherNetPacketObservation) {
+		got = append(got, event)
 	})
-	source := &nethernet.Addr{NetworkID: "private-source", ConnectionID: 42, SelectedCandidate: &webrtc.ICECandidate{Address: "192.0.2.10", Port: 45321}}
-	destination := &nethernet.Addr{NetworkID: "private-destination", ConnectionID: 43, SelectedCandidate: &webrtc.ICECandidate{Address: "192.0.2.11", Port: 45322}}
-	wantSource := NetherNetConnectionIDFromAddr(source)
-	wantDestination := NetherNetConnectionIDFromAddr(destination)
-	cfg.PacketFunc(packet.Header{PacketID: 0x91}, []byte("secret-payload"), source, destination)
-	if called != 1 || gotSource != wantSource || gotDestination != wantDestination || gotPacketID != 0x91 || gotLength != len("secret-payload") {
-		t.Fatal("NetherNet packet observer did not preserve only the expected metadata")
+	cfg.PacketFunc(packet.Header{PacketID: 0x91}, []byte("secret-payload"), remote, local)
+	cfg.PacketFunc(packet.Header{PacketID: 0x92}, []byte("reply"), local, remote)
+	if called != 2 || len(got) != 2 || got[0].Direction != NetherNetPacketInbound || got[1].Direction != NetherNetPacketOutbound || got[0].RemoteID != got[1].RemoteID || got[0].RemoteID != NetherNetConnectionIDFromAddr(remote) || got[0].LocalID != NetherNetConnectionIDFromAddr(local) || got[0].PacketID != 0x91 || got[0].Length != len("secret-payload") || got[1].PacketID != 0x92 || got[1].Length != len("reply") {
+		t.Fatalf("NetherNet packet observer lost direction or client correlation: %+v", got)
 	}
 	for _, forbidden := range []string{"private-source", "private-destination", "192.0.2.10", "192.0.2.11"} {
-		if strings.Contains(string(gotSource), forbidden) || strings.Contains(string(gotDestination), forbidden) {
+		if strings.Contains(string(got[0].RemoteID), forbidden) || strings.Contains(string(got[0].LocalID), forbidden) {
 			t.Fatalf("NetherNet connection ID exposed address metadata: %q", forbidden)
 		}
+	}
+}
+
+func TestNetherNetTransportObserversKeepOneOpaqueConnectionID(t *testing.T) {
+	var ids []NetherNetConnectionID
+	config := netherNetListenConfig(NetherNetConfig{}, Config{NetherNetObservers: NetherNetObservers{
+		ObserveDataChannelMessage: func(id NetherNetConnectionID, _ nethernet.DataChannelMessageObservation) { ids = append(ids, id) },
+		ObserveTransportSnapshot:  func(id NetherNetConnectionID, _ nethernet.TransportSnapshotObservation) { ids = append(ids, id) },
+		ObserveConnectionState:    func(id NetherNetConnectionID, _ nethernet.ConnectionStateObservation) { ids = append(ids, id) },
+	}}, slog.Default(), nil)
+	config.ObserveDataChannelMessage(nethernet.DataChannelMessageObservation{ConnectionID: 42, NetworkID: "client"})
+	config.ObserveTransportSnapshot(nethernet.TransportSnapshotObservation{ConnectionID: 42, NetworkID: "client"})
+	config.ObserveConnectionState(nethernet.ConnectionStateObservation{ConnectionID: 42, NetworkID: "client", State: nethernet.ConnectionStateClosed})
+	want := netherNetConnectionID("client", 42)
+	if len(ids) != 3 || ids[0] != want || ids[1] != want || ids[2] != want || want == netherNetConnectionID("other-client", 42) {
+		t.Fatalf("transport callbacks lost per-network correlation: %v", ids)
 	}
 }
 

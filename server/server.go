@@ -573,6 +573,7 @@ func (srv *Server) createPlayer(id uuid.UUID, conn session.Conn, conf player.Con
 
 	s := session.Config{
 		Log:            srv.conf.Log,
+		ObservePacket:  srv.conf.ObserveSessionPacket,
 		MaxChunkRadius: srv.conf.MaxChunkRadius,
 		EmoteChatMuted: srv.conf.MuteEmoteChat,
 		JoinMessage:    srv.conf.JoinMessage,

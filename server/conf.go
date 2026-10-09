@@ -16,6 +16,7 @@ import (
 	"github.com/df-mc/dragonfly/server/player"
 	"github.com/df-mc/dragonfly/server/player/chat"
 	"github.com/df-mc/dragonfly/server/player/playerdb"
+	"github.com/df-mc/dragonfly/server/session"
 	"github.com/df-mc/dragonfly/server/world"
 	"github.com/df-mc/dragonfly/server/world/biome"
 	"github.com/df-mc/dragonfly/server/world/generator"
@@ -39,6 +40,8 @@ type Config struct {
 	// NetherNetObservers optionally observes the built-in NetherNet listener.
 	// The listener retains its configured identity, signaling address and UDP ports.
 	NetherNetObservers NetherNetObservers
+	// ObserveSessionPacket observes reduced outcomes after inbound session packet dispatch.
+	ObserveSessionPacket func(session.Conn, session.PacketOutcome)
 	// Name is the name of the server. By default, it is shown to users in the
 	// server list before joining the server and when opening the in-game menu.
 	Name string

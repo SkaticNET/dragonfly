@@ -36,6 +36,9 @@ type Config struct {
 	// for each Listener to be added to the Server. If left empty, no players
 	// will be able to connect to the Server.
 	Listeners []func(conf Config) (Listener, error)
+	// NetherNetObservers optionally observes the built-in NetherNet listener.
+	// The listener retains its configured identity, signaling address and UDP ports.
+	NetherNetObservers NetherNetObservers
 	// Name is the name of the server. By default, it is shown to users in the
 	// server list before joining the server and when opening the in-game menu.
 	Name string

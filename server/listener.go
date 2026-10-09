@@ -6,9 +6,12 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"hash/maphash"
 	"io"
 	"log/slog"
 	"net"
@@ -17,6 +20,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/df-mc/dragonfly/server/session"
@@ -25,6 +29,7 @@ import (
 	"github.com/pion/ice/v4"
 	"github.com/pion/webrtc/v4"
 	"github.com/sandertv/gophertunnel/minecraft"
+	"github.com/sandertv/gophertunnel/minecraft/protocol/packet"
 )
 
 // Listener is a source for connections that may be listened on by a Server using Server.listen. Proxies can use this to
@@ -148,6 +153,14 @@ func (uc UserConfig) rakNetListenerFunc(conf Config) (Listener, error) {
 // netherNetListenerFunc returns a Listener accepting NetherNet connections,
 // configured from UserConfig.Network.NetherNet.
 func (uc UserConfig) netherNetListenerFunc(conf Config) (Listener, error) {
+	nc, err := uc.netherNetListenerConfig(conf)
+	if err != nil {
+		return nil, err
+	}
+	return nc.Listener(conf)
+}
+
+func (uc UserConfig) netherNetListenerConfig(conf Config) (NetherNetConfig, error) {
 	nn := uc.Network.NetherNet
 	address := nn.Address
 	if address == "" {
@@ -155,13 +168,13 @@ func (uc UserConfig) netherNetListenerFunc(conf Config) (Listener, error) {
 	}
 	key, err := netherNetKey(nn.KeyFile, conf.Log.With("net origin", "nethernet"))
 	if err != nil {
-		return nil, err
+		return NetherNetConfig{}, err
 	}
 	r, err := parsePortRange(nn.UDPPorts)
 	if err != nil {
-		return nil, fmt.Errorf("parse UDP port range: %w", err)
+		return NetherNetConfig{}, fmt.Errorf("parse UDP port range: %w", err)
 	}
-	return NetherNetConfig{Address: address, Key: key, Domain: nn.Domain, UDPPorts: r}.Listener(conf)
+	return NetherNetConfig{Address: address, Key: key, Domain: nn.Domain, UDPPorts: r, Observers: conf.NetherNetObservers}, nil
 }
 
 // ListenNetwork returns a Listener accepting connections for conf over any
@@ -203,6 +216,68 @@ type NetherNetConfig struct {
 	// UDPPorts is the UDP port range used for player connections. See PortRange
 	// for how single ports and zero bounds behave.
 	UDPPorts PortRange
+	// Observers contains optional hooks for signaling and transport lifecycle
+	// metadata. These hooks do not change identity, authentication or port selection.
+	Observers NetherNetObservers
+}
+
+// NetherNetConnectionID is an opaque, process-local correlation key. It is
+// derived from the connection's NetherNet address using a process-random seed.
+// Observers should use it only for bounded in-memory correlation.
+type NetherNetConnectionID string
+
+// NetherNetRequestID is an opaque, process-local key for one signaling request.
+type NetherNetRequestID string
+
+var netherNetConnectionIDSeed = maphash.MakeSeed()
+
+// NetherNetConnectionIDFromAddr returns an opaque ID for a NetherNet address.
+// It returns the empty ID for other address types.
+func NetherNetConnectionIDFromAddr(addr net.Addr) NetherNetConnectionID {
+	nnAddr, ok := addr.(*nethernet.Addr)
+	if !ok || nnAddr == nil {
+		return ""
+	}
+	var hash maphash.Hash
+	hash.SetSeed(netherNetConnectionIDSeed)
+	_, _ = hash.WriteString(nnAddr.NetworkID)
+	var connectionID [8]byte
+	binary.BigEndian.PutUint64(connectionID[:], nnAddr.ConnectionID)
+	_, _ = hash.Write(connectionID[:])
+	return NetherNetConnectionID(strconv.FormatUint(hash.Sum64(), 16))
+}
+
+type NetherNetSignalingRoute string
+
+const (
+	NetherNetRouteJoinPing  NetherNetSignalingRoute = "join_ping"
+	NetherNetRouteJoinOffer NetherNetSignalingRoute = "join_offer"
+	NetherNetRouteOther     NetherNetSignalingRoute = "other"
+)
+
+// NetherNetSignalingObservation contains reduced HTTP metadata only. It never
+// includes request paths, addresses, headers, bodies or signaling payloads.
+type NetherNetSignalingObservation struct {
+	Route          NetherNetSignalingRoute
+	Method         string
+	StatusCode     int
+	RequestLength  int64
+	ResponseLength int
+	Duration       time.Duration
+}
+
+// NetherNetObservers contains reduced callbacks for the built-in NetherNet
+// listener. No callback receives a connection, HTTP handler, address, or payload.
+type NetherNetObservers struct {
+	ObserveSignaling            func(NetherNetRequestID, NetherNetSignalingObservation)
+	SignalingNegotiationContext func(context.Context, NetherNetRequestID) (context.Context, context.CancelFunc)
+	TransportNegotiationContext func(context.Context) (context.Context, context.CancelFunc)
+	ConnContext                 func(context.Context, NetherNetConnectionID) (context.Context, context.CancelFunc)
+	ObservePacket               func(NetherNetConnectionID, NetherNetConnectionID, uint32, int)
+	ObserveRemoteDescription    func(NetherNetConnectionID, nethernet.RemoteDescriptionStats)
+	ObserveTransportState       func(NetherNetConnectionID, nethernet.TransportLayer, nethernet.TransportState)
+	ObserveDataChannelOpen      func(NetherNetConnectionID, nethernet.MessageReliability)
+	ObserveCorrelationDrop      func(NetherNetConnectionID)
 }
 
 // parsePortRange parses "port" or "min-max" as a PortRange. An empty string
@@ -270,6 +345,7 @@ func (c *closeFuncs) Close() (err error) {
 // Listener returns a Listener accepting NetherNet connections signaled over HTTP.
 func (nc NetherNetConfig) Listener(conf Config) (Listener, error) {
 	log := conf.Log.With("net origin", "nethernet")
+	observers := mergeNetherNetObservers(nc.Observers, conf.NetherNetObservers)
 	if nc.Key == nil {
 		var err error
 		if nc.Key, err = netherNetKey("", log); err != nil {
@@ -292,14 +368,7 @@ func (nc NetherNetConfig) Listener(conf Config) (Listener, error) {
 	} else if err := settingEngine.SetEphemeralUDPPortRange(ports.Min, ports.Max); err != nil {
 		return nil, fmt.Errorf("configure ephemeral udp port range: %w", err)
 	}
-	lcfg := nethernet.ListenConfig{
-		API:            webrtc.NewAPI(webrtc.WithSettingEngine(settingEngine)),
-		Log:            log,
-		AllowAnonymous: conf.AuthDisabled,
-		IssueServerIdentity: func(ctx context.Context) (*nethernet.Identity, error) {
-			return nethernet.GenerateServerIdentity(nc.Key, nc.Domain)
-		},
-	}
+	lcfg := netherNetListenConfig(nc, conf, log, webrtc.NewAPI(webrtc.WithSettingEngine(settingEngine)))
 
 	httpLog := conf.Log.With("net origin", "nethernet-http")
 	httpServer := nc.HTTPServer
@@ -327,8 +396,14 @@ func (nc NetherNetConfig) Listener(conf Config) (Listener, error) {
 		return tcp.Close()
 	})
 
-	handler := endpoint.HandlerConfig{Logger: httpLog, Credentials: nc.Credentials}.New()
-	cfg := listenerConfig(conf)
+	handlerConfig := endpoint.HandlerConfig{Logger: httpLog, Credentials: nc.Credentials}
+	if observers.SignalingNegotiationContext != nil {
+		handlerConfig.NegotiationContext = func(parent context.Context) (context.Context, context.CancelFunc) {
+			return observers.SignalingNegotiationContext(parent, netherNetRequestIDFromContext(parent))
+		}
+	}
+	handler := handlerConfig.New()
+	cfg := observeNetherNetPackets(listenerConfig(conf), observers.ObservePacket)
 	l, err := cfg.ListenNetwork(minecraft.NetherNet{
 		Signaling:    handler,
 		ListenConfig: lcfg,
@@ -338,7 +413,8 @@ func (nc NetherNetConfig) Listener(conf Config) (Listener, error) {
 		return nil, fmt.Errorf("create NetherNet listener: %w", err)
 	}
 
-	httpServer.Handler = logHTTPRequests(httpLog, handler)
+	var signalingHandler http.Handler = observeNetherNetSignaling(handler, observers)
+	httpServer.Handler = logHTTPRequests(httpLog, signalingHandler)
 	serving = true
 	go func() {
 		err := httpServer.Serve(tcp)
@@ -351,11 +427,242 @@ func (nc NetherNetConfig) Listener(conf Config) (Listener, error) {
 	return listener{Listener: l, close: deferred.Close}, nil
 }
 
+func netherNetListenConfig(nc NetherNetConfig, conf Config, log *slog.Logger, api *webrtc.API) nethernet.ListenConfig {
+	observers := mergeNetherNetObservers(nc.Observers, conf.NetherNetObservers)
+	ids := newNetherNetObserverIDs(observers.ObserveCorrelationDrop)
+	cfg := nethernet.ListenConfig{
+		API:            api,
+		Log:            log,
+		AllowAnonymous: conf.AuthDisabled,
+		IssueServerIdentity: func(ctx context.Context) (*nethernet.Identity, error) {
+			return nethernet.GenerateServerIdentity(nc.Key, nc.Domain)
+		},
+		NegotiationContext: observers.TransportNegotiationContext,
+	}
+	if observers.ConnContext != nil {
+		cfg.ConnContext = func(parent context.Context, conn *nethernet.Conn) (context.Context, context.CancelFunc) {
+			id := NetherNetConnectionIDFromAddr(conn.RemoteAddr())
+			ids.put(conn, id)
+			return observers.ConnContext(parent, id)
+		}
+	}
+	if observers.ObserveRemoteDescription != nil || observers.ObserveTransportState != nil || observers.ObserveDataChannelOpen != nil {
+		cfg.ObserveRemoteDescription = func(conn *nethernet.Conn, stats nethernet.RemoteDescriptionStats) {
+			id := NetherNetConnectionIDFromAddr(conn.RemoteAddr())
+			ids.put(conn, id)
+			if id != "" && observers.ObserveRemoteDescription != nil {
+				observers.ObserveRemoteDescription(id, stats)
+			}
+		}
+	}
+	if observers.ConnContext != nil || observers.ObserveRemoteDescription != nil || observers.ObserveTransportState != nil || observers.ObserveDataChannelOpen != nil {
+		cfg.ObserveTransportState = func(conn *nethernet.Conn, layer nethernet.TransportLayer, state nethernet.TransportState) {
+			id := ids.get(conn)
+			if id != "" && observers.ObserveTransportState != nil {
+				observers.ObserveTransportState(id, layer, state)
+			}
+			if state == nethernet.TransportState("closed") || state == nethernet.TransportState("failed") {
+				ids.delete(conn)
+			}
+		}
+	}
+	if observers.ObserveDataChannelOpen != nil {
+		cfg.ObserveDataChannelOpen = func(conn *nethernet.Conn, reliability nethernet.MessageReliability) {
+			if id := ids.get(conn); id != "" {
+				observers.ObserveDataChannelOpen(id, reliability)
+			}
+		}
+	}
+	return cfg
+}
+
+func mergeNetherNetObservers(primary, fallback NetherNetObservers) NetherNetObservers {
+	if primary.ObserveSignaling == nil {
+		primary.ObserveSignaling = fallback.ObserveSignaling
+	}
+	if primary.SignalingNegotiationContext == nil {
+		primary.SignalingNegotiationContext = fallback.SignalingNegotiationContext
+	}
+	if primary.TransportNegotiationContext == nil {
+		primary.TransportNegotiationContext = fallback.TransportNegotiationContext
+	}
+	if primary.ConnContext == nil {
+		primary.ConnContext = fallback.ConnContext
+	}
+	if primary.ObservePacket == nil {
+		primary.ObservePacket = fallback.ObservePacket
+	}
+	if primary.ObserveRemoteDescription == nil {
+		primary.ObserveRemoteDescription = fallback.ObserveRemoteDescription
+	}
+	if primary.ObserveTransportState == nil {
+		primary.ObserveTransportState = fallback.ObserveTransportState
+	}
+	if primary.ObserveDataChannelOpen == nil {
+		primary.ObserveDataChannelOpen = fallback.ObserveDataChannelOpen
+	}
+	if primary.ObserveCorrelationDrop == nil {
+		primary.ObserveCorrelationDrop = fallback.ObserveCorrelationDrop
+	}
+	return primary
+}
+
+type netherNetObserverIDEntry struct {
+	id      NetherNetConnectionID
+	created time.Time
+}
+
+type netherNetObserverIDs struct {
+	mu      sync.Mutex
+	entries map[*nethernet.Conn]netherNetObserverIDEntry
+	onDrop  func(NetherNetConnectionID)
+}
+
+func newNetherNetObserverIDs(onDrop func(NetherNetConnectionID)) *netherNetObserverIDs {
+	return &netherNetObserverIDs{entries: make(map[*nethernet.Conn]netherNetObserverIDEntry), onDrop: onDrop}
+}
+
+func (ids *netherNetObserverIDs) put(conn *nethernet.Conn, id NetherNetConnectionID) {
+	if ids == nil || conn == nil || id == "" {
+		return
+	}
+	ids.mu.Lock()
+	var dropped NetherNetConnectionID
+	if _, ok := ids.entries[conn]; !ok && len(ids.entries) >= 256 {
+		var oldest *nethernet.Conn
+		var created time.Time
+		for candidate, entry := range ids.entries {
+			if oldest == nil || entry.created.Before(created) {
+				oldest, created = candidate, entry.created
+			}
+		}
+		dropped = ids.entries[oldest].id
+		delete(ids.entries, oldest)
+	}
+	if entry, ok := ids.entries[conn]; ok {
+		ids.entries[conn] = netherNetObserverIDEntry{id: id, created: entry.created}
+	} else {
+		ids.entries[conn] = netherNetObserverIDEntry{id: id, created: time.Now()}
+	}
+	ids.mu.Unlock()
+	if dropped != "" && ids.onDrop != nil {
+		ids.onDrop(dropped)
+	}
+}
+
+func (ids *netherNetObserverIDs) get(conn *nethernet.Conn) NetherNetConnectionID {
+	if ids == nil || conn == nil {
+		return ""
+	}
+	ids.mu.Lock()
+	defer ids.mu.Unlock()
+	entry, ok := ids.entries[conn]
+	if !ok {
+		return ""
+	}
+	return entry.id
+}
+
+func (ids *netherNetObserverIDs) delete(conn *nethernet.Conn) {
+	if ids == nil || conn == nil {
+		return
+	}
+	ids.mu.Lock()
+	delete(ids.entries, conn)
+	ids.mu.Unlock()
+}
+
+func observeNetherNetPackets(cfg minecraft.ListenConfig, observe func(NetherNetConnectionID, NetherNetConnectionID, uint32, int)) minecraft.ListenConfig {
+	if observe == nil {
+		return cfg
+	}
+	previous := cfg.PacketFunc
+	cfg.PacketFunc = func(header packet.Header, payload []byte, source, destination net.Addr) {
+		if previous != nil {
+			previous(header, payload, source, destination)
+		}
+		observe(NetherNetConnectionIDFromAddr(source), NetherNetConnectionIDFromAddr(destination), header.PacketID, len(payload))
+	}
+	return cfg
+}
+
+type netherNetRequestIDContextKey struct{}
+
+func netherNetRequestIDFromContext(ctx context.Context) NetherNetRequestID {
+	id, _ := ctx.Value(netherNetRequestIDContextKey{}).(NetherNetRequestID)
+	return id
+}
+
+func newNetherNetRequestID() NetherNetRequestID {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		return ""
+	}
+	return NetherNetRequestID(base64.RawURLEncoding.EncodeToString(value[:]))
+}
+
+func observeNetherNetSignaling(next http.Handler, observers NetherNetObservers) http.Handler {
+	if observers.ObserveSignaling == nil && observers.SignalingNegotiationContext == nil {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestID := newNetherNetRequestID()
+		started := time.Now()
+		counted := &netherNetCountingResponseWriter{ResponseWriter: w}
+		request := r.WithContext(context.WithValue(r.Context(), netherNetRequestIDContextKey{}, requestID))
+		next.ServeHTTP(counted, request)
+		status := counted.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		method := r.Method
+		switch method {
+		case http.MethodGet, http.MethodPost, http.MethodHead, http.MethodOptions:
+		default:
+			method = "OTHER"
+		}
+		route := NetherNetRouteOther
+		switch {
+		case method == http.MethodGet && r.URL.Path == "/v1/join":
+			route = NetherNetRouteJoinPing
+		case method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/join/"):
+			route = NetherNetRouteJoinOffer
+		}
+		if observers.ObserveSignaling != nil {
+			observers.ObserveSignaling(requestID, NetherNetSignalingObservation{Route: route, Method: method, StatusCode: status, RequestLength: r.ContentLength, ResponseLength: counted.bytes, Duration: time.Since(started)})
+		}
+	})
+}
+
+type netherNetCountingResponseWriter struct {
+	http.ResponseWriter
+	status int
+	bytes  int
+}
+
+func (w *netherNetCountingResponseWriter) WriteHeader(status int) {
+	if status >= 200 && w.status == 0 {
+		w.status = status
+	}
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *netherNetCountingResponseWriter) Write(data []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	n, err := w.ResponseWriter.Write(data)
+	w.bytes += n
+	return n, err
+}
+
+func (w *netherNetCountingResponseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
 // logHTTPRequests logs signaling requests at debug level before passing them to next. The
 // endpoint is publicly reachable, so anything louder would let pings and scanners spam the log.
 func logHTTPRequests(log *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Debug("NetherNet HTTP request.", "method", r.Method, "path", r.URL.Path, "raddr", r.RemoteAddr)
+		log.Debug("NetherNet HTTP request.")
 		next.ServeHTTP(w, r)
 	})
 }

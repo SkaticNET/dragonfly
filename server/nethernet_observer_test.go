@@ -67,6 +67,22 @@ func TestNetherNetListenConfigPassesAllObserverCallbacks(t *testing.T) {
 	}
 }
 
+func TestNetherNetObserverMergeIncludesWireCallbacks(t *testing.T) {
+	primarySignaling, fallbackSignaling, fallbackUDP := 0, 0, 0
+	merged := mergeNetherNetObservers(
+		NetherNetObservers{ObserveSignalingWire: func(NetherNetSignalingWireObservation) { primarySignaling++ }},
+		NetherNetObservers{
+			ObserveSignalingWire: func(NetherNetSignalingWireObservation) { fallbackSignaling++ },
+			ObserveUDPWire:       func(NetherNetUDPWireObservation) { fallbackUDP++ },
+		},
+	)
+	merged.ObserveSignalingWire(NetherNetSignalingWireObservation{})
+	merged.ObserveUDPWire(NetherNetUDPWireObservation{})
+	if primarySignaling != 1 || fallbackSignaling != 0 || fallbackUDP != 1 {
+		t.Fatal("wire observer merge did not preserve primary precedence and fill missing callbacks")
+	}
+}
+
 func TestNetherNetRawPacketObserverPreservesPreviousCallback(t *testing.T) {
 	var calls []string
 	conf := Config{NetherNetObservers: NetherNetObservers{ObserveRawPacket: func(minecraft.PacketObservation) {
@@ -169,6 +185,16 @@ func TestBuiltInNetherNetListenerInvokesObserversDuringNegotiation(t *testing.T)
 		}
 	}
 	observers := NetherNetObservers{
+		ObserveSignalingWire: func(event NetherNetSignalingWireObservation) {
+			if len(event.Bytes) != 0 {
+				mark("signaling-wire-" + string(event.Direction))
+			}
+		},
+		ObserveUDPWire: func(event NetherNetUDPWireObservation) {
+			if len(event.Bytes) != 0 {
+				mark("udp-wire-" + string(event.Direction))
+			}
+		},
 		ObserveSignaling: func(id NetherNetRequestID, observation NetherNetSignalingObservation) {
 			if observation.Route == NetherNetRouteJoinOffer && observation.Method == "POST" && observation.StatusCode >= 200 {
 				mu.Lock()
@@ -265,6 +291,7 @@ func TestBuiltInNetherNetListenerInvokesObserversDuringNegotiation(t *testing.T)
 
 	want := []string{
 		"signaling", "remote-description", "transport-state", "data-channel",
+		"signaling-wire-inbound", "signaling-wire-outbound", "udp-wire-inbound", "udp-wire-outbound",
 		"signaling-negotiation-start", "signaling-negotiation-closed",
 		"transport-negotiation-start", "transport-negotiation-closed",
 		"transport-context-start", "transport-context-closed",
@@ -295,5 +322,76 @@ func TestBuiltInNetherNetListenerInvokesObserversDuringNegotiation(t *testing.T)
 	mu.Unlock()
 	if !idsMatch {
 		t.Fatal("signaling response and negotiation did not share an opaque request ID")
+	}
+}
+
+func TestBuiltInNetherNetFixedPortMuxInvokesUDPWireObserver(t *testing.T) {
+	directions := make(chan NetherNetPacketDirection, 64)
+	conf := Config{
+		Log:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		MaxPlayers:   10,
+		AuthDisabled: true,
+		Allower:      allower{},
+		NetherNetObservers: NetherNetObservers{ObserveUDPWire: func(event NetherNetUDPWireObservation) {
+			if len(event.Bytes) != 0 {
+				select {
+				case directions <- event.Direction:
+				default:
+				}
+			}
+		}},
+	}
+	var address string
+	var listener Listener
+	for attempt := 0; attempt < 5; attempt++ {
+		tcp, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal("reserve local signaling address")
+		}
+		address = tcp.Addr().String()
+		if err := tcp.Close(); err != nil {
+			t.Fatal("release local signaling address")
+		}
+		udp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatal("reserve local UDP port")
+		}
+		port := uint16(udp.LocalAddr().(*net.UDPAddr).Port)
+		if err := udp.Close(); err != nil {
+			t.Fatal("release local UDP port")
+		}
+		config := NetherNetConfig{Address: address, UDPPorts: PortRange{Min: port, Max: port}}
+		listener, err = config.Listener(conf)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, syscall.EADDRINUSE) {
+			t.Fatal("built-in fixed-port NetherNet listener failed to start")
+		}
+	}
+	if listener == nil {
+		t.Fatal("could not reserve local listener ports after bounded retries")
+	}
+	defer listener.Close()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	client := endpoint.ClientConfig{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}.New()
+	conn, err := (nethernet.Dialer{DisableTrickleICE: true}).DialContext(ctx, "http://"+address, client)
+	if err != nil {
+		t.Fatal("local fixed-port NetherNet negotiation failed")
+	}
+	defer conn.Close()
+
+	seen := map[NetherNetPacketDirection]bool{}
+	deadline := time.NewTimer(3 * time.Second)
+	defer deadline.Stop()
+	for !seen[NetherNetPacketInbound] || !seen[NetherNetPacketOutbound] {
+		select {
+		case direction := <-directions:
+			seen[direction] = true
+		case <-deadline.C:
+			t.Fatalf("fixed-port UDP observer directions: inbound=%t outbound=%t", seen[NetherNetPacketInbound], seen[NetherNetPacketOutbound])
+		}
 	}
 }

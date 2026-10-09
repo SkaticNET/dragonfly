@@ -27,6 +27,8 @@ import (
 	"github.com/df-mc/go-nethernet"
 	"github.com/df-mc/go-nethernet/endpoint"
 	"github.com/pion/ice/v4"
+	"github.com/pion/transport/v5"
+	"github.com/pion/transport/v5/stdnet"
 	"github.com/pion/webrtc/v4"
 	"github.com/sandertv/gophertunnel/minecraft"
 	"github.com/sandertv/gophertunnel/minecraft/protocol/packet"
@@ -271,12 +273,18 @@ type NetherNetSignalingObservation struct {
 }
 
 // NetherNetObservers contains opt-in callbacks for the built-in NetherNet
-// listener. DataChannelMessage can contain raw login and gameplay bytes;
-// TransportSnapshot can contain SDP, ICE credentials, and peer addresses.
-// ObserveRawPacket can contain decoded packet values and raw packet bytes.
-// Callers must restrict access to these sensitive observations.
+// listener. DataChannelMessage can contain raw login/gameplay bytes;
+// TransportSnapshot can contain SDP, ICE credentials, and peer addresses;
+// ObserveRawPacket can contain decoded values and raw packet bytes. Wire
+// callbacks receive raw signaling bytes and ICE/WebRTC UDP datagrams, which may
+// contain credentials or encrypted player traffic, plus peer addresses. Restrict
+// access to them.
+// Wire callbacks may run concurrently and must be fast/non-blocking; their byte
+// slices are independent copies, and callback panics are ignored.
 type NetherNetObservers struct {
 	ObserveSignaling            func(NetherNetRequestID, NetherNetSignalingObservation)
+	ObserveSignalingWire        func(NetherNetSignalingWireObservation)
+	ObserveUDPWire              func(NetherNetUDPWireObservation)
 	SignalingNegotiationContext func(context.Context, NetherNetRequestID) (context.Context, context.CancelFunc)
 	TransportNegotiationContext func(context.Context) (context.Context, context.CancelFunc)
 	ConnContext                 func(context.Context, NetherNetConnectionID) (context.Context, context.CancelFunc)
@@ -297,6 +305,27 @@ const (
 	NetherNetPacketInbound  NetherNetPacketDirection = "inbound"
 	NetherNetPacketOutbound NetherNetPacketDirection = "outbound"
 )
+
+// NetherNetSignalingWireObservation contains the n > 0 bytes from one read or
+// write on the plaintext signaling TCP stream. ByteOffset is zero-based within
+// its direction; TCP read boundaries are not HTTP message boundaries.
+type NetherNetSignalingWireObservation struct {
+	ConnectionID NetherNetConnectionID
+	LocalAddr    net.Addr
+	RemoteAddr   net.Addr
+	Direction    NetherNetPacketDirection
+	ByteOffset   uint64
+	Bytes        []byte
+}
+
+// NetherNetUDPWireObservation contains the n > 0 payload bytes from one
+// ICE/WebRTC UDP socket read or write.
+type NetherNetUDPWireObservation struct {
+	Direction  NetherNetPacketDirection
+	LocalAddr  net.Addr
+	RemoteAddr net.Addr
+	Bytes      []byte
+}
 
 // NetherNetPacketObservation relates a decoded packet to the remote client on both directions.
 type NetherNetPacketObservation struct {
@@ -385,8 +414,21 @@ func (nc NetherNetConfig) Listener(conf Config) (Listener, error) {
 
 	var deferred closeFuncs
 	settingEngine := webrtc.SettingEngine{}
+	var wireNet transport.Net
+	if observers.ObserveUDPWire != nil {
+		baseNet, err := stdnet.NewNet()
+		if err != nil {
+			return nil, fmt.Errorf("create NetherNet UDP observation net: %w", err)
+		}
+		wireNet = observeNetherNetUDPNet(baseNet, observers.ObserveUDPWire)
+		settingEngine.SetNet(wireNet)
+	}
 	if ports := nc.UDPPorts; ports.Min != 0 && ports.Min == ports.Max {
-		mux, err := ice.NewMultiUDPMuxFromPort(int(ports.Min))
+		var muxOptions []ice.UDPMuxFromPortOption
+		if wireNet != nil {
+			muxOptions = append(muxOptions, ice.UDPMuxFromPortWithNet(wireNet))
+		}
+		mux, err := ice.NewMultiUDPMuxFromPort(int(ports.Min), muxOptions...)
 		if err != nil {
 			return nil, fmt.Errorf("allocate UDP mux: %w", err)
 		}
@@ -445,7 +487,7 @@ func (nc NetherNetConfig) Listener(conf Config) (Listener, error) {
 	httpServer.Handler = logHTTPRequests(httpLog, signalingHandler)
 	serving = true
 	go func() {
-		err := httpServer.Serve(tcp)
+		err := httpServer.Serve(observeNetherNetSignalingWire(tcp, observers.ObserveSignalingWire))
 		if err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
 			conf.Log.Error("NetherNet HTTP listener closed unexpectedly: " + err.Error())
 		}
@@ -528,6 +570,12 @@ func netherNetListenConfig(nc NetherNetConfig, conf Config, log *slog.Logger, ap
 func mergeNetherNetObservers(primary, fallback NetherNetObservers) NetherNetObservers {
 	if primary.ObserveSignaling == nil {
 		primary.ObserveSignaling = fallback.ObserveSignaling
+	}
+	if primary.ObserveSignalingWire == nil {
+		primary.ObserveSignalingWire = fallback.ObserveSignalingWire
+	}
+	if primary.ObserveUDPWire == nil {
+		primary.ObserveUDPWire = fallback.ObserveUDPWire
 	}
 	if primary.SignalingNegotiationContext == nil {
 		primary.SignalingNegotiationContext = fallback.SignalingNegotiationContext

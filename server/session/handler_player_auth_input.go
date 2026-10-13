@@ -18,27 +18,55 @@ type PlayerAuthInputHandler struct{}
 // Handle ...
 func (h PlayerAuthInputHandler) Handle(p packet.Packet, s *Session, tx *world.Tx, c Controllable) error {
 	pk := p.(*packet.PlayerAuthInput)
-	if err := h.handleMovement(pk, s, c); err != nil {
+	accepted, err := h.handleMovement(pk, s, c)
+	if err != nil {
 		return err
 	}
-	return h.handleActions(pk, s, tx, c)
+	if err := h.handleActions(pk, s, tx, c); err != nil {
+		return err
+	}
+	if observe := s.conf.AfterPlayerAuthInput; observe != nil {
+		if s.hasPlayerAuthInputTick && pk.Tick <= s.lastPlayerAuthInputTick {
+			return nil
+		}
+		s.lastPlayerAuthInputTick, s.hasPlayerAuthInputTick = pk.Tick, true
+		epoch := uint64(1)
+		if e, ok := c.(interface{ SprintEpochForWorld(*world.World) uint64 }); ok && tx != nil {
+			epoch = e.SprintEpochForWorld(tx.World())
+		} else if e, ok := c.(interface{ SprintEpoch() uint64 }); ok {
+			epoch = e.SprintEpoch()
+		}
+		observe(tx, c, PlayerAuthInputState{
+			OwnRuntimeID: selfEntityRuntimeID, Tick: pk.Tick, Epoch: epoch,
+			Accepted: accepted, HorizontalCollision: pk.InputData.Load(packet.InputFlagHorizontalCollision),
+			StartRequested: pk.InputData.Load(packet.InputFlagStartSprinting),
+		})
+	}
+	return nil
 }
 
 // handleMovement handles the movement part of the packet.PlayerAuthInput.
-func (h PlayerAuthInputHandler) handleMovement(pk *packet.PlayerAuthInput, s *Session, c Controllable) error {
+func (h PlayerAuthInputHandler) handleMovement(pk *packet.PlayerAuthInput, s *Session, c Controllable) (bool, error) {
 	yaw, pitch := c.Rotation().Elem()
 	pos := c.Position()
 
 	reference := []float64{pitch, yaw, yaw, pos[0], pos[1], pos[2]}
+	invalid := false
 	for i, v := range [...]*float32{&pk.Pitch, &pk.Yaw, &pk.HeadYaw, &pk.Position[0], &pk.Position[1], &pk.Position[2]} {
 		f := float64(*v)
 		if math.IsNaN(f) || math.IsInf(f, 1) || math.IsInf(f, 0) {
+			invalid = true
 			// Sometimes, the PlayerAuthInput packet is in fact sent with NaN/INF after being teleported (to another
 			// world), see #425. For this reason, we don't actually return an error if this happens, because this will
 			// result in the player being kicked. Just log it and replace the NaN value with the one we have tracked
 			// server-side.
 			s.conf.Log.Debug("process packet: PlayerAuthInput: found nan/inf values. assuming server-side values", "pos", fmt.Sprint(pk.Position), "yaw", pk.Yaw, "head-yaw", pk.HeadYaw, "pitch", pk.Pitch)
 			*v = float32(reference[i])
+		}
+	}
+	for _, v := range pk.MoveVector {
+		if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
+			invalid = true
 		}
 	}
 
@@ -55,15 +83,21 @@ func (h PlayerAuthInputHandler) handleMovement(pk *packet.PlayerAuthInput, s *Se
 				// The player has moved before it received the teleport packet. Ignore this movement entirely and
 				// wait for the client to sync itself back to the server. Once we get a movement that is close
 				// enough to the teleport position, we'll allow the player to move around again.
-				return nil
+				return false, nil
 			}
 			s.teleportPos.Store(nil)
 		}
 	}
+	teleportPending := s.teleportPos.Load() != nil
 
 	s.moving = true
+	if mover, ok := c.(interface {
+		MoveWithResult(mgl64.Vec3, float64, float64) bool
+	}); ok {
+		return mover.MoveWithResult(deltaPos, deltaYaw, deltaPitch) && !invalid && !teleportPending, nil
+	}
 	c.Move(deltaPos, deltaYaw, deltaPitch)
-	return nil
+	return false, nil
 }
 
 // handleActions handles the actions with the world that are present in the PlayerAuthInput packet.

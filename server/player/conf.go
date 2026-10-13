@@ -88,6 +88,7 @@ func (cfg Config) Apply(data *world.EntityData) {
 		fireTicks:           conf.FireTicks,
 		fallDistance:        conf.FallDistance,
 	}
+	pdata.sprintEpoch.Store(1)
 	playerUUID := conf.UUID
 	pdata.portalTravel = &entity.PortalTravelComputer{
 		Instantaneous: func(_, target world.Dimension) bool {

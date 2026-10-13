@@ -42,6 +42,10 @@ type Config struct {
 	NetherNetObservers NetherNetObservers
 	// ObserveSessionPacket observes reduced outcomes after inbound session packet dispatch.
 	ObserveSessionPacket func(session.Conn, session.PacketOutcome)
+	// AfterPlayerAuthInput runs synchronously inside the entity world transaction
+	// after a PlayerAuthInput's movement and actions succeed. Callback arguments
+	// must not be retained or used asynchronously.
+	AfterPlayerAuthInput func(*world.Tx, session.Controllable, session.PlayerAuthInputState)
 	// Name is the name of the server. By default, it is shown to users in the
 	// server list before joining the server and when opening the in-game menu.
 	Name string

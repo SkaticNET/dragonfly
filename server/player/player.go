@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/df-mc/dragonfly/server/block"
@@ -41,6 +42,9 @@ import (
 )
 
 type playerData struct {
+	sprintEpoch       atomic.Uint64
+	sprintWorldMu     sync.Mutex
+	sprintWorld       *world.World
 	xuid              string
 	locale            language.Tag
 	nameTag, scoreTag string
@@ -1025,7 +1029,9 @@ func (p *Player) respawn(f func(p *Player)) {
 	}
 	task := w.Do(func(tx *world.Tx) {
 		np := tx.AddEntity(handle).(*Player)
+		respawnEpoch := np.SprintEpoch()
 		np.Teleport(pos)
+		np.markRespawnSent(respawnEpoch)
 		np.session().SendRespawn(pos, p)
 		np.SetVisible()
 		if f != nil {
@@ -2295,6 +2301,7 @@ func (p *Player) forceTeleport(pos mgl64.Vec3) {
 
 // teleport teleports the player to a target position in the world without updating non-positional state.
 func (p *Player) teleport(pos mgl64.Vec3) {
+	p.advanceSprintEpoch()
 	for _, v := range p.viewers() {
 		v.ViewEntityTeleport(p, pos)
 	}
@@ -2307,15 +2314,30 @@ func (p *Player) teleport(pos mgl64.Vec3) {
 // position of the player.
 // Move also rotates the player, adding deltaYaw and deltaPitch to the respective values.
 func (p *Player) Move(deltaPos mgl64.Vec3, deltaYaw, deltaPitch float64) {
-	if p.Dead() || (deltaPos.ApproxEqual(mgl64.Vec3{}) && mgl64.FloatEqual(deltaYaw, 0) && mgl64.FloatEqual(deltaPitch, 0)) {
+	p.move(deltaPos, deltaYaw, deltaPitch)
+}
+
+// MoveWithResult runs the same validated player-movement path as Move and
+// reports whether the requested movement was accepted by the player handler.
+func (p *Player) MoveWithResult(deltaPos mgl64.Vec3, deltaYaw, deltaPitch float64) bool {
+	return p.move(deltaPos, deltaYaw, deltaPitch)
+}
+
+func (p *Player) move(deltaPos mgl64.Vec3, deltaYaw, deltaPitch float64) bool {
+	if p.Dead() {
 		p.onGround = true
 		p.updateFallState(deltaPos.Y())
-		return
+		return false
+	}
+	if deltaPos.ApproxEqual(mgl64.Vec3{}) && mgl64.FloatEqual(deltaYaw, 0) && mgl64.FloatEqual(deltaPitch, 0) {
+		p.onGround = true
+		p.updateFallState(deltaPos.Y())
+		return !p.immobile
 	}
 	if p.immobile {
 		if mgl64.FloatEqual(deltaYaw, 0) && mgl64.FloatEqual(deltaPitch, 0) {
 			// If only the position was changed, don't continue with the movement when immobile.
-			return
+			return false
 		}
 		// Still update rotation if it was changed.
 		deltaPos = mgl64.Vec3{}
@@ -2331,7 +2353,7 @@ func (p *Player) Move(deltaPos mgl64.Vec3, deltaYaw, deltaPitch float64) {
 			// player of this movement change.
 			p.teleport(pos)
 		}
-		return
+		return false
 	}
 	for _, v := range p.viewers() {
 		v.ViewEntityMovement(p, res, resRot, p.OnGround())
@@ -2374,6 +2396,43 @@ func (p *Player) Move(deltaPos mgl64.Vec3, deltaYaw, deltaPitch float64) {
 		p.Exhaust(0.01 * horizontalVel.Len())
 	} else if p.Sprinting() {
 		p.Exhaust(0.1 * horizontalVel.Len())
+	}
+	return true
+}
+
+// SprintEpoch identifies the current uninterrupted movement region for the
+// player's bounded input-state observation.
+func (p *Player) SprintEpoch() uint64 {
+	return p.sprintEpoch.Load()
+}
+
+// SprintEpochForWorld advances the input generation when an input arrives in
+// a different world, before the player's next regular Tick can observe it.
+func (p *Player) SprintEpochForWorld(w *world.World) uint64 {
+	if w == nil {
+		return p.SprintEpoch()
+	}
+	p.sprintWorldMu.Lock()
+	if p.sprintWorld == nil {
+		p.sprintWorld = w
+	} else if p.sprintWorld != w {
+		p.sprintWorld = w
+		p.advanceSprintEpoch()
+	}
+	current := p.SprintEpoch()
+	p.sprintWorldMu.Unlock()
+	return current
+}
+
+func (p *Player) advanceSprintEpoch() {
+	p.sprintEpoch.Add(1)
+}
+
+// markRespawnSent ensures the respawn boundary advances the epoch even when
+// HandleTeleport canceled the accompanying positional teleport.
+func (p *Player) markRespawnSent(previousEpoch uint64) {
+	if p.SprintEpoch() == previousEpoch {
+		p.advanceSprintEpoch()
 	}
 }
 
@@ -2711,6 +2770,7 @@ func (p *Player) Tick(tx *world.Tx, current int64) {
 		p.Handler().HandleChangeWorld(p, p.prevWorld, tx.World())
 	}
 	p.prevWorld = tx.World()
+	p.SprintEpochForWorld(tx.World())
 
 	if p.session() == session.Nop && !p.Immobile() {
 		m := p.mc.TickMovement(p, p.Position(), p.Velocity(), p.Rotation(), p.tx)

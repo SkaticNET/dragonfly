@@ -37,6 +37,9 @@ type Session struct {
 	once, connOnce sync.Once
 	packetOrdinal  atomic.Uint64
 
+	lastPlayerAuthInputTick uint64
+	hasPlayerAuthInputTick  bool
+
 	ent      *world.EntityHandle
 	conn     Conn
 	handlers map[uint32]packetHandler
@@ -162,6 +165,9 @@ type Config struct {
 	// ObservePacket is called after each inbound packet is dispatched, with only
 	// its connection, wire ordinal, ID, type, and bounded outcome status.
 	ObservePacket func(Conn, PacketOutcome)
+	// AfterPlayerAuthInput is called synchronously after a PlayerAuthInput has
+	// completed movement and actions. Nil leaves this observation fully off.
+	AfterPlayerAuthInput func(*world.Tx, Controllable, PlayerAuthInputState)
 
 	MaxChunkRadius int
 
@@ -175,6 +181,16 @@ type Config struct {
 	HandleStop func(*world.Tx, Controllable)
 	// BlockRegistry overrides the registry used for network serialization. If nil, world.DefaultBlockRegistry is used.
 	BlockRegistry world.BlockRegistry
+}
+
+// PlayerAuthInputState is the value-only outcome of one accepted PlayerAuthInput.
+type PlayerAuthInputState struct {
+	OwnRuntimeID        uint64
+	Tick                uint64
+	Epoch               uint64
+	Accepted            bool
+	HorizontalCollision bool
+	StartRequested      bool
 }
 
 // PacketStatus is the reduced outcome of dispatching an inbound packet.
